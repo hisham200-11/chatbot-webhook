@@ -43,12 +43,10 @@ app.post('/webhook', async (req, res) => {
 
 // ── Your keyword logic ──
 async function getReply(message) {
-    const firstWord = message.split(' ')[0];
-
     try {
         const [rows] = await db.query(
-            'SELECT reply FROM keywords WHERE keyword = ? LIMIT 1',
-            [firstWord]
+            'SELECT reply FROM keywords WHERE ? LIKE CONCAT("%", keyword, "%") LIMIT 1',
+            [message]
         );
         if (rows.length > 0) return rows[0].reply;
     } catch (err) {
