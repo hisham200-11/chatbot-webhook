@@ -1,1 +1,4 @@
 .env
+package.json
+schema.sql
+node_modules
