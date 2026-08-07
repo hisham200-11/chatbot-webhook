@@ -2,3 +2,5 @@
 package.json
 schema.sql
 node_modules
+node_modules/
+schema.sql
