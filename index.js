@@ -93,8 +93,8 @@ Pricing guide (use as RANGES only):
 
 Always respond with valid JSON matching the required schema. The reply_text field is what will be sent to the patient.`;
 
-// ── JSON response schema for structured output ──
-const RESPONSE_SCHEMA = {
+// ── JSON response schemas for structured output ──
+const OPENAI_SCHEMA = {
     type: 'object',
     properties: {
         reply_text:           { type: 'string', description: 'The message to send back to the patient' },
@@ -107,6 +107,20 @@ const RESPONSE_SCHEMA = {
     },
     required: ['reply_text', 'patient_name', 'patient_phone', 'procedure_interested', 'preferred_schedule', 'is_ready_for_booking', 'is_handoff'],
     additionalProperties: false,
+};
+
+const GEMINI_SCHEMA = {
+    type: 'OBJECT',
+    properties: {
+        reply_text:           { type: 'STRING', description: 'The message to send back to the patient' },
+        patient_name:         { type: 'STRING', nullable: true, description: 'Patient name if mentioned, null otherwise' },
+        patient_phone:        { type: 'STRING', nullable: true, description: 'Patient phone number if mentioned, null otherwise' },
+        procedure_interested: { type: 'STRING', nullable: true, description: 'Dental procedure they are asking about, null if unclear' },
+        preferred_schedule:   { type: 'STRING', nullable: true, description: 'When they want to come in, null if not mentioned' },
+        is_ready_for_booking: { type: 'BOOLEAN', description: 'True if patient provided both name AND phone number' },
+        is_handoff:           { type: 'BOOLEAN', description: 'True if patient explicitly wants to talk to a human/dentist' },
+    },
+    required: ['reply_text', 'is_ready_for_booking', 'is_handoff'],
 };
 
 // ============================================================
@@ -249,7 +263,7 @@ async function getOpenAIResponse(chatHistory, currentMessage) {
             json_schema: {
                 name: 'dental_response',
                 strict: true,
-                schema: RESPONSE_SCHEMA,
+                schema: OPENAI_SCHEMA,
             },
         },
         temperature: 0.7,
@@ -265,15 +279,11 @@ async function getGeminiResponse(chatHistory, currentMessage) {
     if (!gemini) {
         const { GoogleGenAI } = await import('@google/genai');
         gemini = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-        console.log('AI Provider: Gemini 2.5 Flash (free tier)');
+        console.log('AI Provider: Gemini 3.6 Flash (free tier)');
     }
 
     // Build contents array for Gemini multi-turn format
     const contents = [];
-
-    // Add system instruction as the first user context
-    contents.push({ role: 'user', parts: [{ text: SYSTEM_PROMPT + '\n\nPlease follow the above instructions for all responses.' }] });
-    contents.push({ role: 'model', parts: [{ text: 'Understood. I will act as the dental clinic AI concierge and respond with the required JSON schema.' }] });
 
     // Add chat history
     for (const msg of chatHistory) {
@@ -286,14 +296,17 @@ async function getGeminiResponse(chatHistory, currentMessage) {
     // Add current message
     contents.push({ role: 'user', parts: [{ text: currentMessage }] });
 
+    const geminiModel = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+
     const response = await gemini.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: geminiModel,
         contents,
         config: {
+            systemInstruction: SYSTEM_PROMPT,
             responseMimeType: 'application/json',
-            responseSchema: RESPONSE_SCHEMA,
+            responseSchema: GEMINI_SCHEMA,
             temperature: 0.7,
-            maxOutputTokens: 512,
+            maxOutputTokens: 1024,
         },
     });
 

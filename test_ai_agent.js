@@ -46,7 +46,7 @@ function buildSystemPrompt() {
     ].join('\n');
 }
 
-var RESPONSE_SCHEMA = {
+var OPENAI_SCHEMA = {
     type: 'object',
     properties: {
         reply_text:           { type: 'string', description: 'The message to send back to the patient' },
@@ -59,6 +59,20 @@ var RESPONSE_SCHEMA = {
     },
     required: ['reply_text', 'patient_name', 'patient_phone', 'procedure_interested', 'preferred_schedule', 'is_ready_for_booking', 'is_handoff'],
     additionalProperties: false,
+};
+
+var GEMINI_SCHEMA = {
+    type: 'OBJECT',
+    properties: {
+        reply_text:           { type: 'STRING', description: 'The message to send back to the patient' },
+        patient_name:         { type: 'STRING', nullable: true, description: 'Patient name if mentioned' },
+        patient_phone:        { type: 'STRING', nullable: true, description: 'Patient phone if mentioned' },
+        procedure_interested: { type: 'STRING', nullable: true, description: 'Dental procedure' },
+        preferred_schedule:   { type: 'STRING', nullable: true, description: 'When they want to come in' },
+        is_ready_for_booking: { type: 'BOOLEAN', description: 'True if both name AND phone provided' },
+        is_handoff:           { type: 'BOOLEAN', description: 'True if patient wants a human' },
+    },
+    required: ['reply_text', 'is_ready_for_booking', 'is_handoff'],
 };
 
 var TEST_SCENARIOS = [
@@ -102,7 +116,7 @@ async function callOpenAI(scenarioMessages) {
         messages: messages,
         response_format: {
             type: 'json_schema',
-            json_schema: { name: 'dental_response', strict: true, schema: RESPONSE_SCHEMA },
+            json_schema: { name: 'dental_response', strict: true, schema: OPENAI_SCHEMA },
         },
         temperature: 0.7,
         max_tokens: 512,
@@ -118,10 +132,6 @@ async function callGemini(scenarioMessages) {
     var client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
     var contents = [];
-    var sysPrompt = buildSystemPrompt();
-    contents.push({ role: 'user', parts: [{ text: sysPrompt + '\n\nPlease follow the above instructions for all responses.' }] });
-    contents.push({ role: 'model', parts: [{ text: 'Understood. I will act as the dental clinic AI concierge and respond with the required JSON schema.' }] });
-
     for (var i = 0; i < scenarioMessages.length; i++) {
         var msg = scenarioMessages[i];
         contents.push({
@@ -130,14 +140,17 @@ async function callGemini(scenarioMessages) {
         });
     }
 
+    var geminiModel = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+
     var response = await client.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: geminiModel,
         contents: contents,
         config: {
+            systemInstruction: buildSystemPrompt(),
             responseMimeType: 'application/json',
-            responseSchema: RESPONSE_SCHEMA,
+            responseSchema: GEMINI_SCHEMA,
             temperature: 0.7,
-            maxOutputTokens: 512,
+            maxOutputTokens: 1024,
         },
     });
 
