@@ -1,6 +1,4 @@
-.env
-package.json
-schema.sql
-node_modules
 node_modules/
-schema.sql
+.env
+.DS_Store
+Thumbs.db
