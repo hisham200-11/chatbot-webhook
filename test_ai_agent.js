@@ -1,17 +1,16 @@
 // ============================================================
 // test_ai_agent.js - Simulate dental patient conversations
+// Supports: Gemini Flash (free, default) or OpenAI GPT-4o-mini
 // Run: node test_ai_agent.js
-// Requires: OPENAI_API_KEY in .env (no DB or Facebook needed)
 // ============================================================
 require('dotenv').config();
-const OpenAI = require('openai');
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+var AI_PROVIDER = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
 
-const CLINIC_NAME     = process.env.CLINIC_NAME     || 'BrightSmile Dental Clinic';
-const CLINIC_LOCATION = process.env.CLINIC_LOCATION || 'BGC, Taguig City';
-const CLINIC_HOURS    = process.env.CLINIC_HOURS    || 'Mon-Sat 9AM-6PM';
-const CLINIC_SERVICES = process.env.CLINIC_SERVICES || 'Veneers, Dental Implants, Braces, Teeth Whitening, General Dentistry';
+var CLINIC_NAME     = process.env.CLINIC_NAME     || 'BrightSmile Dental Clinic';
+var CLINIC_LOCATION = process.env.CLINIC_LOCATION || 'BGC, Taguig City';
+var CLINIC_HOURS    = process.env.CLINIC_HOURS    || 'Mon-Sat 9AM-6PM';
+var CLINIC_SERVICES = process.env.CLINIC_SERVICES || 'Veneers, Dental Implants, Braces, Teeth Whitening, General Dentistry';
 
 function buildSystemPrompt() {
     var loc = CLINIC_LOCATION ? ' located in ' + CLINIC_LOCATION : '';
@@ -91,32 +90,73 @@ var TEST_SCENARIOS = [
     },
 ];
 
+// ── OpenAI call ──
+async function callOpenAI(scenarioMessages) {
+    var OpenAI = require('openai');
+    var client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    var messages = [{ role: 'system', content: buildSystemPrompt() }].concat(scenarioMessages);
+
+    var completion = await client.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: messages,
+        response_format: {
+            type: 'json_schema',
+            json_schema: { name: 'dental_response', strict: true, schema: RESPONSE_SCHEMA },
+        },
+        temperature: 0.7,
+        max_tokens: 512,
+    });
+
+    return JSON.parse(completion.choices[0].message.content);
+}
+
+// ── Gemini call ──
+async function callGemini(scenarioMessages) {
+    var genaiModule = await import('@google/genai');
+    var GoogleGenAI = genaiModule.GoogleGenAI;
+    var client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+    var contents = [];
+    var sysPrompt = buildSystemPrompt();
+    contents.push({ role: 'user', parts: [{ text: sysPrompt + '\n\nPlease follow the above instructions for all responses.' }] });
+    contents.push({ role: 'model', parts: [{ text: 'Understood. I will act as the dental clinic AI concierge and respond with the required JSON schema.' }] });
+
+    for (var i = 0; i < scenarioMessages.length; i++) {
+        var msg = scenarioMessages[i];
+        contents.push({
+            role: msg.role === 'user' ? 'user' : 'model',
+            parts: [{ text: msg.content }],
+        });
+    }
+
+    var response = await client.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: contents,
+        config: {
+            responseMimeType: 'application/json',
+            responseSchema: RESPONSE_SCHEMA,
+            temperature: 0.7,
+            maxOutputTokens: 512,
+        },
+    });
+
+    return JSON.parse(response.text);
+}
+
 async function runTest(scenario) {
     console.log('\n' + '='.repeat(60));
     console.log(scenario.name);
     console.log('='.repeat(60));
 
-    var messages = [
-        { role: 'system', content: buildSystemPrompt() },
-    ].concat(scenario.messages);
-
     try {
-        var completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages: messages,
-            response_format: {
-                type: 'json_schema',
-                json_schema: {
-                    name: 'dental_response',
-                    strict: true,
-                    schema: RESPONSE_SCHEMA,
-                },
-            },
-            temperature: 0.7,
-            max_tokens: 512,
-        });
+        var parsed;
+        if (AI_PROVIDER === 'openai') {
+            parsed = await callOpenAI(scenario.messages);
+        } else {
+            parsed = await callGemini(scenario.messages);
+        }
 
-        var parsed = JSON.parse(completion.choices[0].message.content);
         var lastUserMsg = scenario.messages[scenario.messages.length - 1].content;
 
         console.log('\nPatient said: "' + lastUserMsg + '"');
@@ -138,14 +178,19 @@ async function runTest(scenario) {
 
 async function main() {
     console.log('Dental AI Agent - Test Suite');
-    console.log('Using model: gpt-4o-mini');
-    console.log('API Key: ' + (process.env.OPENAI_API_KEY ? 'Set' : 'MISSING'));
+    console.log('AI Provider: ' + AI_PROVIDER);
 
-    if (!process.env.OPENAI_API_KEY) {
+    if (AI_PROVIDER === 'openai' && !process.env.OPENAI_API_KEY) {
         console.error('\nERROR: OPENAI_API_KEY not found in .env file.');
-        console.error('Add it to your .env: OPENAI_API_KEY=sk-your-key-here');
         process.exit(1);
     }
+    if (AI_PROVIDER === 'gemini' && !process.env.GEMINI_API_KEY) {
+        console.error('\nERROR: GEMINI_API_KEY not found in .env file.');
+        console.error('Get your FREE key at: https://aistudio.google.com/apikey');
+        process.exit(1);
+    }
+
+    console.log('API Key: Set');
 
     var passed = 0;
     var failed = 0;

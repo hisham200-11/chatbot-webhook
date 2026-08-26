@@ -1,16 +1,29 @@
 // ============================================================
 // Facebook Messenger — AI Dental Lead Qualification Engine
-// Powered by OpenAI GPT-4o-mini with structured JSON output
+// Supports: Gemini Flash (free) or OpenAI GPT-4o-mini
+// Set AI_PROVIDER=gemini (default) or AI_PROVIDER=openai in .env
 // ============================================================
 require('dotenv').config();
 const express    = require('express');
 const mysql      = require('mysql2/promise');
 const axios      = require('axios');
 const nodemailer = require('nodemailer');
-const OpenAI     = require('openai');
 
 const app = express();
 app.use(express.json());
+
+// ── AI Provider selection ──
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
+
+let openai = null;
+let gemini = null;
+
+if (AI_PROVIDER === 'openai') {
+    const OpenAI = require('openai');
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    console.log('AI Provider: OpenAI GPT-4o-mini');
+}
+// Gemini is initialized asynchronously below (ESM import)
 
 // ── DB connection pool ──
 const db = mysql.createPool({
@@ -21,8 +34,6 @@ const db = mysql.createPool({
     database: process.env.DB_NAME,
 });
 
-// ── OpenAI client ──
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ── Email transport (for lead notifications) ──
 const mailer = nodemailer.createTransport({
@@ -206,47 +217,102 @@ async function handleEcho(event) {
 }
 
 // ============================================================
-// AI Response — GPT-4o-mini with structured JSON output
+// AI Response — Dual provider: Gemini Flash (free) or OpenAI
 // ============================================================
 async function getAIResponse(chatHistory, currentMessage) {
+    try {
+        if (AI_PROVIDER === 'openai') {
+            return await getOpenAIResponse(chatHistory, currentMessage);
+        } else {
+            return await getGeminiResponse(chatHistory, currentMessage);
+        }
+    } catch (err) {
+        console.error(`${AI_PROVIDER} API error:`, err.message);
+        // Graceful fallback if AI is down
+        return getFallbackResponse();
+    }
+}
+
+// ── OpenAI GPT-4o-mini ──
+async function getOpenAIResponse(chatHistory, currentMessage) {
     const messages = [
         { role: 'system', content: SYSTEM_PROMPT },
         ...chatHistory,
         { role: 'user', content: currentMessage },
     ];
 
-    try {
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages,
-            response_format: {
-                type: 'json_schema',
-                json_schema: {
-                    name: 'dental_response',
-                    strict: true,
-                    schema: RESPONSE_SCHEMA,
-                },
+    const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages,
+        response_format: {
+            type: 'json_schema',
+            json_schema: {
+                name: 'dental_response',
+                strict: true,
+                schema: RESPONSE_SCHEMA,
             },
-            temperature: 0.7,
-            max_tokens: 512,
-        });
+        },
+        temperature: 0.7,
+        max_tokens: 512,
+    });
 
-        const parsed = JSON.parse(completion.choices[0].message.content);
-        return parsed;
-    } catch (err) {
-        console.error('OpenAI API error:', err.message);
-        // Graceful fallback if AI is down
-        return {
-            reply_text: "Sorry po, I'm having a brief technical issue. Please try again in a moment, or type \"agent\" to connect with our clinic team directly! 😊",
-            patient_name: null,
-            patient_phone: null,
-            procedure_interested: null,
-            preferred_schedule: null,
-            is_ready_for_booking: false,
-            is_handoff: false,
-        };
-    }
+    return JSON.parse(completion.choices[0].message.content);
 }
+
+// ── Google Gemini Flash (free tier) ──
+async function getGeminiResponse(chatHistory, currentMessage) {
+    // Lazy-init Gemini client on first call (ESM dynamic import)
+    if (!gemini) {
+        const { GoogleGenAI } = await import('@google/genai');
+        gemini = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+        console.log('AI Provider: Gemini 2.5 Flash (free tier)');
+    }
+
+    // Build contents array for Gemini multi-turn format
+    const contents = [];
+
+    // Add system instruction as the first user context
+    contents.push({ role: 'user', parts: [{ text: SYSTEM_PROMPT + '\n\nPlease follow the above instructions for all responses.' }] });
+    contents.push({ role: 'model', parts: [{ text: 'Understood. I will act as the dental clinic AI concierge and respond with the required JSON schema.' }] });
+
+    // Add chat history
+    for (const msg of chatHistory) {
+        contents.push({
+            role: msg.role === 'user' ? 'user' : 'model',
+            parts: [{ text: msg.content }],
+        });
+    }
+
+    // Add current message
+    contents.push({ role: 'user', parts: [{ text: currentMessage }] });
+
+    const response = await gemini.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents,
+        config: {
+            responseMimeType: 'application/json',
+            responseSchema: RESPONSE_SCHEMA,
+            temperature: 0.7,
+            maxOutputTokens: 512,
+        },
+    });
+
+    return JSON.parse(response.text);
+}
+
+// ── Fallback when AI is unavailable ──
+function getFallbackResponse() {
+    return {
+        reply_text: "Sorry po, I'm having a brief technical issue. Please try again in a moment, or type \"agent\" to connect with our clinic team directly! 😊",
+        patient_name: null,
+        patient_phone: null,
+        procedure_interested: null,
+        preferred_schedule: null,
+        is_ready_for_booking: false,
+        is_handoff: false,
+    };
+}
+
 
 // ============================================================
 // Load recent chat history for multi-turn context
