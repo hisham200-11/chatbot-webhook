@@ -1,11 +1,13 @@
 // ============================================================
-// Facebook Messenger chatbot — persistent chat + human handoff
+// Facebook Messenger — AI Dental Lead Qualification Engine
+// Powered by OpenAI GPT-4o-mini with structured JSON output
 // ============================================================
 require('dotenv').config();
-const express  = require('express');
-const mysql    = require('mysql2/promise');
-const axios    = require('axios');
+const express    = require('express');
+const mysql      = require('mysql2/promise');
+const axios      = require('axios');
 const nodemailer = require('nodemailer');
+const OpenAI     = require('openai');
 
 const app = express();
 app.use(express.json());
@@ -19,7 +21,10 @@ const db = mysql.createPool({
     database: process.env.DB_NAME,
 });
 
-// ── Email transport (for handoff notifications) ──
+// ── OpenAI client ──
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ── Email transport (for lead notifications) ──
 const mailer = nodemailer.createTransport({
     host:   process.env.SMTP_HOST,
     port:   Number(process.env.SMTP_PORT || 587),
@@ -34,11 +39,64 @@ const mailer = nodemailer.createTransport({
 const HANDOFF_KEYWORDS = [
     'agent', 'human', 'representative', 'real person',
     'talk to someone', 'speak to someone', 'customer service',
-    'talk to a person', 'live agent',
+    'talk to a person', 'live agent', 'talk to the dentist',
+    'makausap', 'tao', 'real na tao',
 ];
 
 // Command an admin types manually in Messenger to give control back to the bot
 const RESUME_COMMAND = '/bot resume';
+
+// ── Clinic configuration (from .env) ──
+const CLINIC_NAME     = process.env.CLINIC_NAME     || 'Our Dental Clinic';
+const CLINIC_LOCATION = process.env.CLINIC_LOCATION || '';
+const CLINIC_HOURS    = process.env.CLINIC_HOURS    || 'Mon-Sat 9AM-6PM';
+const CLINIC_SERVICES = process.env.CLINIC_SERVICES || 'Veneers, Dental Implants, Braces, Teeth Whitening, General Dentistry';
+
+// ── Dental concierge system prompt ──
+const SYSTEM_PROMPT = `You are the friendly, professional AI concierge for ${CLINIC_NAME}${CLINIC_LOCATION ? ` located in ${CLINIC_LOCATION}` : ''}.
+Clinic hours: ${CLINIC_HOURS}.
+Services offered: ${CLINIC_SERVICES}.
+
+Your goals (in priority order):
+1. Warmly greet the patient and answer their dental questions naturally.
+2. Provide transparent pricing RANGES (never exact quotes — always say "starts from ₱X depending on clinical assessment").
+3. Gently guide the conversation toward booking a FREE consultation / 3D smile assessment.
+4. Collect the patient's NAME and PHONE NUMBER so the clinic can confirm the appointment.
+5. If they ask to speak with a human or the dentist directly, set is_handoff to true.
+
+Conversation rules:
+- Be warm, empathetic, and conversational. Use polite Filipino particles (po, opo) when the patient writes in Tagalog/Taglish.
+- NEVER diagnose or give medical advice. Always recommend an in-person assessment.
+- Keep replies concise (2-4 sentences max). Do not write essays.
+- If you already have their name and phone, do NOT ask again — just confirm the booking.
+- If the patient seems unsure, reassure them that the consultation is free and no-commitment.
+
+Pricing guide (use as RANGES only):
+- Teeth Cleaning: ₱800 – ₱2,500
+- Teeth Whitening: ₱5,000 – ₱15,000
+- Braces (Metal): ₱35,000 – ₱80,000
+- Invisalign / Clear Aligners: ₱80,000 – ₱200,000
+- Porcelain Veneers: ₱8,000 – ₱25,000 per tooth
+- Dental Implants: ₱60,000 – ₱120,000 per tooth
+- Wisdom Tooth Extraction: ₱5,000 – ₱15,000
+
+Always respond with valid JSON matching the required schema. The reply_text field is what will be sent to the patient.`;
+
+// ── JSON response schema for structured output ──
+const RESPONSE_SCHEMA = {
+    type: 'object',
+    properties: {
+        reply_text:           { type: 'string', description: 'The message to send back to the patient' },
+        patient_name:         { type: ['string', 'null'], description: 'Patient name if mentioned, null otherwise' },
+        patient_phone:        { type: ['string', 'null'], description: 'Patient phone number if mentioned, null otherwise' },
+        procedure_interested: { type: ['string', 'null'], description: 'Dental procedure they are asking about, null if unclear' },
+        preferred_schedule:   { type: ['string', 'null'], description: 'When they want to come in, null if not mentioned' },
+        is_ready_for_booking: { type: 'boolean', description: 'True if patient provided both name AND phone number' },
+        is_handoff:           { type: 'boolean', description: 'True if patient explicitly wants to talk to a human/dentist' },
+    },
+    required: ['reply_text', 'patient_name', 'patient_phone', 'procedure_interested', 'preferred_schedule', 'is_ready_for_booking', 'is_handoff'],
+    additionalProperties: false,
+};
 
 // ============================================================
 // Facebook webhook verification (GET)
@@ -80,7 +138,8 @@ async function handleUserMessage(event) {
     const rawText  = event.message.text;
     const text     = rawText.toLowerCase().trim();
 
-    const conversation = await getOrCreateConversation(senderId);
+    // Get or create conversation, capturing ad referral if present
+    const conversation = await getOrCreateConversation(senderId, event.referral);
     await logMessage(conversation.id, 'user', rawText);
 
     // A human is already handling this thread — bot stays silent.
@@ -88,44 +147,47 @@ async function handleUserMessage(event) {
         return;
     }
 
-    // We just asked for name/contact — treat this message as that answer.
-    if (conversation.status === 'awaiting_lead_info') {
-        await saveLeadInfo(conversation.id, senderId, rawText);
-        return;
-    }
-
-    // Check if the user is asking for a human.
+    // Check if the user is explicitly asking for a human (before AI).
     if (detectHandoffIntent(text)) {
         await db.query(
             'UPDATE conversations SET status = ? WHERE id = ?',
-            ['awaiting_lead_info', conversation.id]
+            ['pending_human', conversation.id]
         );
-        const reply = "Sure — I can connect you with our team. Could you share your name and the best email or phone number to reach you?";
+        const reply = "Sure po — I'll connect you with our clinic team right away. Someone will message you shortly! 😊";
         await logMessage(conversation.id, 'bot', reply);
         await sendReply(senderId, reply);
+        await notifyAdmin(senderId, conversation, 'Patient requested to speak with a human/dentist.');
         return;
     }
 
-    // Otherwise, normal FAQ keyword reply.
-    const reply = await getKeywordReply(text);
-    await logMessage(conversation.id, 'bot', reply);
-    await sendReply(senderId, reply);
+    // ── AI-powered conversation ──
+    const chatHistory = await getRecentChatHistory(conversation.id, 6);
+    const aiResponse  = await getAIResponse(chatHistory, rawText);
+
+    // Send the reply to the patient
+    await logMessage(conversation.id, 'bot', aiResponse.reply_text);
+    await sendReply(senderId, aiResponse.reply_text);
+
+    // If AI detected handoff intent
+    if (aiResponse.is_handoff) {
+        await db.query('UPDATE conversations SET status = ? WHERE id = ?', ['pending_human', conversation.id]);
+        await notifyAdmin(senderId, conversation, 'Patient requested to speak with a human/dentist.');
+        return;
+    }
+
+    // Update lead info if AI extracted any new data
+    await updateLeadInfo(conversation, aiResponse, senderId);
 }
 
 // ============================================================
-// Handle an "echo" event — a message that came FROM your Page.
-// This fires both when the bot replies via the API, and when a
-// human manually replies through the Messenger / Page Inbox app.
-// We tell them apart using app_id: messages sent through our own
-// API call carry our app_id; messages typed by a human in the
-// inbox UI don't.
+// Handle an "echo" event — a message from your Page.
 // ============================================================
 async function handleEcho(event) {
     const senderId = event.recipient.id; // for echoes, "recipient" is the customer
     const text     = event.message.text || '';
     const sentByOurApp = String(event.message.app_id || '') === String(process.env.FB_APP_ID || '');
 
-    if (sentByOurApp) return; // this is just our own bot reply being echoed back, ignore
+    if (sentByOurApp) return; // our own bot reply echoed back, ignore
 
     // A human manually sent this from the Page Inbox / Messenger app.
     const conversation = await getOrCreateConversation(senderId);
@@ -144,64 +206,147 @@ async function handleEcho(event) {
 }
 
 // ============================================================
-// Save the lead's name/contact, notify admin, hand off
+// AI Response — GPT-4o-mini with structured JSON output
 // ============================================================
-async function saveLeadInfo(conversationId, senderId, rawText) {
-    const contact = extractContact(rawText);
+async function getAIResponse(chatHistory, currentMessage) {
+    const messages = [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...chatHistory,
+        { role: 'user', content: currentMessage },
+    ];
 
-    await db.query(
-        'UPDATE conversations SET status = ?, lead_name = ?, lead_contact = ?, lead_verified = 1 WHERE id = ?',
-        ['pending_human', rawText.slice(0, 255), contact, conversationId]
+    try {
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages,
+            response_format: {
+                type: 'json_schema',
+                json_schema: {
+                    name: 'dental_response',
+                    strict: true,
+                    schema: RESPONSE_SCHEMA,
+                },
+            },
+            temperature: 0.7,
+            max_tokens: 512,
+        });
+
+        const parsed = JSON.parse(completion.choices[0].message.content);
+        return parsed;
+    } catch (err) {
+        console.error('OpenAI API error:', err.message);
+        // Graceful fallback if AI is down
+        return {
+            reply_text: "Sorry po, I'm having a brief technical issue. Please try again in a moment, or type \"agent\" to connect with our clinic team directly! 😊",
+            patient_name: null,
+            patient_phone: null,
+            procedure_interested: null,
+            preferred_schedule: null,
+            is_ready_for_booking: false,
+            is_handoff: false,
+        };
+    }
+}
+
+// ============================================================
+// Load recent chat history for multi-turn context
+// ============================================================
+async function getRecentChatHistory(conversationId, limit = 6) {
+    const [rows] = await db.query(
+        'SELECT sender, message_text FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?',
+        [conversationId, limit]
     );
 
-    const ackText = "Thanks! Someone from our team will reach out shortly.";
-    await logMessage(conversationId, 'bot', ackText);
-    await sendReply(senderId, ackText);
-
-    await notifyAdmin(senderId, rawText, contact);
-}
-
-// Very simple email/phone grab; falls back to the raw text.
-function extractContact(text) {
-    const emailMatch = text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
-    if (emailMatch) return emailMatch[0];
-    const phoneMatch = text.match(/\+?\d[\d\s-]{6,}\d/);
-    if (phoneMatch) return phoneMatch[0].trim();
-    return text.slice(0, 255);
-}
-
-function detectHandoffIntent(text) {
-    return HANDOFF_KEYWORDS.some(k => text.includes(k));
+    // Reverse to chronological order, then map to OpenAI message format
+    return rows.reverse().map(row => ({
+        role: row.sender === 'user' ? 'user' : 'assistant',
+        content: row.message_text,
+    }));
 }
 
 // ============================================================
-// FAQ keyword lookup (used only while status = 'bot')
+// Update lead information when AI extracts new data
 // ============================================================
-async function getKeywordReply(message) {
-    try {
-        const [rows] = await db.query(
-            'SELECT reply FROM keywords WHERE ? LIKE CONCAT("%", keyword, "%") LIMIT 1',
-            [message]
-        );
-        if (rows.length > 0) return rows[0].reply;
-    } catch (err) {
-        console.error('DB error:', err.message);
+async function updateLeadInfo(conversation, aiResponse, senderId) {
+    const updates = [];
+    const params  = [];
+
+    if (aiResponse.patient_name && !conversation.patient_name) {
+        updates.push('patient_name = ?');
+        params.push(aiResponse.patient_name.slice(0, 255));
     }
-    return "Sorry, I didn't understand that. You can also type \"agent\" to talk to a real person.";
+    if (aiResponse.patient_phone && !conversation.patient_phone) {
+        updates.push('patient_phone = ?');
+        params.push(aiResponse.patient_phone.slice(0, 64));
+    }
+    if (aiResponse.procedure_interested && !conversation.procedure_interested) {
+        updates.push('procedure_interested = ?');
+        params.push(aiResponse.procedure_interested.slice(0, 128));
+    }
+    if (aiResponse.preferred_schedule && !conversation.preferred_schedule) {
+        updates.push('preferred_schedule = ?');
+        params.push(aiResponse.preferred_schedule.slice(0, 128));
+    }
+
+    // Mark as qualified when both name and phone are captured
+    const hasName  = aiResponse.patient_name  || conversation.patient_name;
+    const hasPhone = aiResponse.patient_phone || conversation.patient_phone;
+    const wasQualified = conversation.is_qualified;
+
+    if (hasName && hasPhone && !wasQualified) {
+        updates.push('is_qualified = 1');
+        updates.push("status = 'qualified_lead'");
+    }
+
+    if (updates.length === 0) return;
+
+    params.push(conversation.id);
+    await db.query(
+        `UPDATE conversations SET ${updates.join(', ')} WHERE id = ?`,
+        params
+    );
+
+    // Send instant notification when a lead becomes qualified for the first time
+    if (hasName && hasPhone && !wasQualified) {
+        const updatedConvo = {
+            ...conversation,
+            patient_name:        aiResponse.patient_name  || conversation.patient_name,
+            patient_phone:       aiResponse.patient_phone || conversation.patient_phone,
+            procedure_interested: aiResponse.procedure_interested || conversation.procedure_interested,
+            preferred_schedule:  aiResponse.preferred_schedule || conversation.preferred_schedule,
+        };
+        await notifyAdmin(senderId, updatedConvo, 'NEW QUALIFIED LEAD — Patient provided name and contact info!');
+    }
 }
 
 // ============================================================
 // Conversation + message helpers
 // ============================================================
-async function getOrCreateConversation(senderId) {
+async function getOrCreateConversation(senderId, referral) {
     const [rows] = await db.query('SELECT * FROM conversations WHERE sender_id = ?', [senderId]);
-    if (rows.length > 0) return rows[0];
+    if (rows.length > 0) {
+        // If this is an ad click and we haven't stored ad info yet, update it
+        if (referral && referral.ad_id && !rows[0].ad_id) {
+            await db.query(
+                'UPDATE conversations SET ad_id = ?, ad_title = ? WHERE id = ?',
+                [referral.ad_id, referral.ad_title || null, rows[0].id]
+            );
+            rows[0].ad_id    = referral.ad_id;
+            rows[0].ad_title = referral.ad_title || null;
+        }
+        return rows[0];
+    }
 
     const [result] = await db.query(
-        'INSERT INTO conversations (sender_id, status) VALUES (?, "bot")',
-        [senderId]
+        'INSERT INTO conversations (sender_id, status, ad_id, ad_title) VALUES (?, "bot", ?, ?)',
+        [senderId, referral?.ad_id || null, referral?.ad_title || null]
     );
-    return { id: result.insertId, sender_id: senderId, status: 'bot' };
+    return {
+        id: result.insertId, sender_id: senderId, status: 'bot',
+        patient_name: null, patient_phone: null, procedure_interested: null,
+        preferred_schedule: null, is_qualified: 0,
+        ad_id: referral?.ad_id || null, ad_title: referral?.ad_title || null,
+    };
 }
 
 async function logMessage(conversationId, sender, text) {
@@ -209,6 +354,10 @@ async function logMessage(conversationId, sender, text) {
         'INSERT INTO messages (conversation_id, sender, message_text) VALUES (?, ?, ?)',
         [conversationId, sender, text]
     );
+}
+
+function detectHandoffIntent(text) {
+    return HANDOFF_KEYWORDS.some(k => text.includes(k));
 }
 
 // ============================================================
@@ -233,22 +382,33 @@ async function sendReply(recipientId, text) {
 }
 
 // ============================================================
-// Email the admin when a verified lead is ready for handoff
+// Email the admin when a qualified lead or handoff request arrives
 // ============================================================
-async function notifyAdmin(senderId, rawText, contact) {
+async function notifyAdmin(senderId, conversation, subject) {
     try {
+        const adInfo = conversation.ad_id
+            ? `\nAd ID: ${conversation.ad_id}\nAd Title: ${conversation.ad_title || 'N/A'}`
+            : '\nSource: Organic (no ad click)';
+
         await mailer.sendMail({
             from: process.env.SMTP_USER,
             to:   process.env.ADMIN_EMAIL,
-            subject: `New lead ready for handoff (PSID: ${senderId})`,
+            subject: `🦷 ${subject} (PSID: ${senderId})`,
             text:
-`A visitor asked to talk to a human and left contact info.
+`${subject}
+
+──────────────────────────
+Patient Details:
+  Name:      ${conversation.patient_name || 'Not yet provided'}
+  Phone:     ${conversation.patient_phone || 'Not yet provided'}
+  Procedure: ${conversation.procedure_interested || 'Not yet specified'}
+  Schedule:  ${conversation.preferred_schedule || 'Not yet specified'}
+${adInfo}
+──────────────────────────
 
 Facebook PSID: ${senderId}
-Message: ${rawText}
-Extracted contact: ${contact}
 
-Reply directly in the Messenger/Page Inbox app to take over.
+Reply directly in the Messenger / Page Inbox app to take over.
 Type "${RESUME_COMMAND}" in that thread when you're done to hand control back to the bot.`,
         });
     } catch (err) {
@@ -257,4 +417,4 @@ Type "${RESUME_COMMAND}" in that thread when you're done to hand control back to
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Webhook running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🦷 Dental AI Webhook running on port ${PORT}`));
