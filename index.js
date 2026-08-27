@@ -233,6 +233,15 @@ async function handleEcho(event) {
 
     if (sentByOurApp) return; // our own bot reply echoed back, ignore
 
+    // Ignore Meta Business Suite default automated greeting / instant reply echoes
+    const isAutomatedMetaGreeting = text.includes("Thank you for reaching out") || 
+                                    text.includes("Frequently Asked Questions") ||
+                                    text.includes("automation solutions");
+    if (isAutomatedMetaGreeting) {
+        console.log('ℹ️ Ignored Meta automated greeting echo.');
+        return;
+    }
+
     // A human manually sent this from the Page Inbox / Messenger app.
     const conversation = await getOrCreateConversation(senderId);
     await logMessage(conversation.id, 'agent', text);
@@ -246,6 +255,7 @@ async function handleEcho(event) {
     // Any other manual message = human has taken over. Silence the bot.
     if (conversation.status !== 'human') {
         await db.query('UPDATE conversations SET status = ? WHERE id = ?', ['human', conversation.id]);
+        console.log(`👤 Human takeover detected for PSID: ${senderId}. Bot paused.`);
     }
 }
 
