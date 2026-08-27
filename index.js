@@ -525,17 +525,21 @@ async function sendReply(recipientId, text) {
 // Email the admin when a qualified lead or handoff request arrives
 // ============================================================
 async function notifyAdmin(senderId, conversation, subject) {
-    try {
-        const adInfo = conversation.ad_id
-            ? `\nAd ID: ${conversation.ad_id}\nAd Title: ${conversation.ad_title || 'N/A'}`
-            : '\nSource: Organic (no ad click)';
+    const smtpUser   = process.env.SMTP_USER || '';
+    const smtpPass   = process.env.SMTP_PASS || '';
+    const adminEmail = process.env.ADMIN_EMAIL || '';
 
-        await mailer.sendMail({
-            from: process.env.SMTP_USER,
-            to:   process.env.ADMIN_EMAIL,
-            subject: `🦷 ${subject} (PSID: ${senderId})`,
-            text:
-`${subject}
+    const isSmtpConfigured = smtpUser && 
+                             smtpPass && 
+                             adminEmail && 
+                             !smtpUser.includes('your_email') && 
+                             !smtpPass.includes('your_app');
+
+    const adInfo = conversation.ad_id
+        ? `\nAd ID: ${conversation.ad_id}\nAd Title: ${conversation.ad_title || 'N/A'}`
+        : '\nSource: Organic (no ad click)';
+
+    const emailBody = `${subject}
 
 ──────────────────────────
 Patient Details:
@@ -549,10 +553,29 @@ ${adInfo}
 Facebook PSID: ${senderId}
 
 Reply directly in the Messenger / Page Inbox app to take over.
-Type "${RESUME_COMMAND}" in that thread when you're done to hand control back to the bot.`,
+Type "${RESUME_COMMAND}" in that thread when you're done to hand control back to the bot.`;
+
+    if (!isSmtpConfigured) {
+        console.log(`\n🔔 [LEAD / HANDOFF ALERT] (SMTP not configured, logging to console):`);
+        console.log(`   Subject:   ${subject}`);
+        console.log(`   Patient:   ${conversation.patient_name || 'N/A'} | Phone: ${conversation.patient_phone || 'N/A'}`);
+        console.log(`   Procedure: ${conversation.procedure_interested || 'N/A'}`);
+        console.log(`   PSID:      ${senderId}`);
+        console.log(`👉 To receive real email alerts, add your Gmail App Password to SMTP_USER & SMTP_PASS in .env\n`);
+        return;
+    }
+
+    try {
+        await mailer.sendMail({
+            from: smtpUser,
+            to:   adminEmail,
+            subject: `🦷 ${subject} (PSID: ${senderId})`,
+            text: emailBody,
         });
+        console.log(`📧 [EMAIL SENT] Lead alert sent to ${adminEmail}`);
     } catch (err) {
-        console.error('Email notification failed:', err.message);
+        console.error('⚠️ Email notification failed:', err.message);
+        console.error('👉 If using Gmail, make sure SMTP_PASS is a 16-character Google App Password (not your regular Gmail password).');
     }
 }
 
