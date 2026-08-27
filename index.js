@@ -98,7 +98,17 @@ Pricing guide (use as RANGES only):
 - Dental Implants: ₱60,000 – ₱120,000 per tooth
 - Wisdom Tooth Extraction: ₱5,000 – ₱15,000
 
-Always respond with valid JSON matching the required schema. The reply_text field is what will be sent to the patient.`;
+CRITICAL OUTPUT REQUIREMENT:
+Always respond with a valid JSON object matching this EXACT structure:
+{
+  "reply_text": "Your natural conversational Taglish response to send to the patient",
+  "patient_name": "Extracted patient full name if provided (e.g. 'Juan Dela Cruz'), or null",
+  "patient_phone": "Extracted Philippine phone number if provided (e.g. '0917-123-4567'), or null",
+  "procedure_interested": "Dental procedure mentioned (e.g. 'Braces', 'Cleaning', 'Veneers'), or null",
+  "preferred_schedule": "Preferred appointment day/time if mentioned (e.g. 'Saturday morning'), or null",
+  "is_ready_for_booking": true if patient provided both name and contact number, otherwise false,
+  "is_handoff": true if patient explicitly wants to speak with a human/dentist/agent, otherwise false
+}`;
 
 
 // Phrases that mean "I want to talk to a real person"
@@ -228,8 +238,8 @@ async function handleUserMessage(event) {
         return;
     }
 
-    // Update lead info if AI extracted any new data
-    await updateLeadInfo(conversation, aiResponse, senderId);
+    // Update lead info if AI extracted any new data (with regex fallback)
+    await updateLeadInfo(conversation, aiResponse, senderId, rawText);
 }
 
 // ============================================================
@@ -407,30 +417,49 @@ async function getRecentChatHistory(conversationId, limit = 6) {
 // ============================================================
 // Update lead information when AI extracts new data
 // ============================================================
-async function updateLeadInfo(conversation, aiResponse, senderId) {
+async function updateLeadInfo(conversation, aiResponse, senderId, rawText = '') {
     const updates = [];
     const params  = [];
 
-    if (aiResponse.patient_name && !conversation.patient_name) {
+    // Fallback regex for Philippine mobile numbers (e.g. 0917-123-4567, 09171234567, +639171234567)
+    let extractedPhone = aiResponse.patient_phone;
+    if (!extractedPhone && rawText) {
+        const phoneMatch = rawText.match(/(?:09|\+639)\d{2}[-\s]?\d{3}[-\s]?\d{4}|(?:09|\+639)\d{9}/);
+        if (phoneMatch) extractedPhone = phoneMatch[0];
+    }
+
+    // Fallback regex for Name patterns (e.g. "ako po si Juan Santos", "name ko is Maria")
+    let extractedName = aiResponse.patient_name;
+    if (!extractedName && rawText) {
+        const nameMatch = rawText.match(/(?:ako po si|name ko is|name ko po is|my name is|im|i am)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)/i);
+        if (nameMatch) extractedName = nameMatch[1];
+    }
+
+    const patientName = extractedName || null;
+    const patientPhone = extractedPhone || null;
+    const procedure = aiResponse.procedure_interested || null;
+    const schedule = aiResponse.preferred_schedule || null;
+
+    if (patientName && !conversation.patient_name) {
         updates.push('patient_name = ?');
-        params.push(aiResponse.patient_name.slice(0, 255));
+        params.push(patientName.slice(0, 255));
     }
-    if (aiResponse.patient_phone && !conversation.patient_phone) {
+    if (patientPhone && !conversation.patient_phone) {
         updates.push('patient_phone = ?');
-        params.push(aiResponse.patient_phone.slice(0, 64));
+        params.push(patientPhone.slice(0, 64));
     }
-    if (aiResponse.procedure_interested && !conversation.procedure_interested) {
+    if (procedure && !conversation.procedure_interested) {
         updates.push('procedure_interested = ?');
-        params.push(aiResponse.procedure_interested.slice(0, 128));
+        params.push(procedure.slice(0, 128));
     }
-    if (aiResponse.preferred_schedule && !conversation.preferred_schedule) {
+    if (schedule && !conversation.preferred_schedule) {
         updates.push('preferred_schedule = ?');
-        params.push(aiResponse.preferred_schedule.slice(0, 128));
+        params.push(schedule.slice(0, 128));
     }
 
     // Mark as qualified when both name and phone are captured
-    const hasName  = aiResponse.patient_name  || conversation.patient_name;
-    const hasPhone = aiResponse.patient_phone || conversation.patient_phone;
+    const hasName  = patientName  || conversation.patient_name;
+    const hasPhone = patientPhone || conversation.patient_phone;
     const wasQualified = conversation.is_qualified;
 
     if (hasName && hasPhone && !wasQualified) {
@@ -450,12 +479,12 @@ async function updateLeadInfo(conversation, aiResponse, senderId) {
     if (hasName && hasPhone && !wasQualified) {
         const updatedConvo = {
             ...conversation,
-            patient_name:        aiResponse.patient_name  || conversation.patient_name,
-            patient_phone:       aiResponse.patient_phone || conversation.patient_phone,
-            procedure_interested: aiResponse.procedure_interested || conversation.procedure_interested,
-            preferred_schedule:  aiResponse.preferred_schedule || conversation.preferred_schedule,
+            patient_name:        hasName,
+            patient_phone:       hasPhone,
+            procedure_interested: procedure || conversation.procedure_interested,
+            preferred_schedule:  schedule  || conversation.preferred_schedule,
         };
-        await notifyAdmin(senderId, updatedConvo, 'NEW QUALIFIED LEAD — Patient provided name and contact info!');
+        await notifyAdmin(senderId, updatedConvo, '🎉 New Qualified Dental Lead!');
     }
 }
 
