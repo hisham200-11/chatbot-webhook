@@ -537,5 +537,26 @@ Type "${RESUME_COMMAND}" in that thread when you're done to hand control back to
     }
 }
 
+// Global error logging so the server never crashes silently
+process.on('uncaughtException', (err) => {
+    console.error('💥 Uncaught Exception:', err.message || err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('💥 Unhandled Rejection:', reason);
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🦷 Dental AI Webhook running on port ${PORT}`));
+app.listen(PORT, async () => {
+    console.log(`🦷 Dental AI Webhook running on port ${PORT}`);
+    console.log(`🤖 Active AI Provider: ${AI_PROVIDER.toUpperCase()}`);
+    
+    // Startup DB sanity check
+    try {
+        await db.query('SELECT 1 + 1 AS db_check');
+        console.log(`✅ MySQL connected successfully (${process.env.DB_NAME || 'chatbot_db'})`);
+    } catch (err) {
+        console.error(`❌ MySQL Connection Warning: ${err.message}`);
+        console.error('👉 Check your DB_HOST, DB_USER, DB_PASS, DB_PORT in .env');
+    }
+});
+
