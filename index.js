@@ -286,7 +286,7 @@ async function getGroqResponse(chatHistory, currentMessage) {
         { role: 'user', content: currentMessage },
     ];
 
-    const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+    const model = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 
     const completion = await groq.chat.completions.create({
         model,
