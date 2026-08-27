@@ -546,8 +546,8 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-    console.log(`🦷 Dental AI Webhook running on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', async () => {
+    console.log(`🦷 Dental AI Webhook running on http://0.0.0.0:${PORT}`);
     console.log(`🤖 Active AI Provider: ${AI_PROVIDER.toUpperCase()}`);
     
     // Startup DB sanity check
@@ -559,4 +559,8 @@ app.listen(PORT, async () => {
         console.error('👉 Check your DB_HOST, DB_USER, DB_PASS, DB_PORT in .env');
     }
 });
+
+// Keep process active indefinitely
+setInterval(() => {}, 1000 * 60 * 60);
+
 
