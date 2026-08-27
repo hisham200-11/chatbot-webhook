@@ -167,22 +167,25 @@ app.get('/webhook', (req, res) => {
 // ============================================================
 // Receive events from Facebook (POST)
 // ============================================================
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', (req, res) => {
     res.sendStatus(200); // ack fast so Facebook doesn't retry
 
     const entries = req.body.entry || [];
+    const tasks = [];
+
     for (const entry of entries) {
         for (const event of entry.messaging || []) {
-            try {
-                if (event.message?.is_echo) {
-                    await handleEcho(event);
-                } else if (event.message?.text) {
-                    await handleUserMessage(event);
-                }
-            } catch (err) {
-                console.error('💥 Error handling event:', err);
+            if (event.message?.is_echo) {
+                tasks.push(handleEcho(event).catch(err => console.error('💥 Error handling echo:', err)));
+            } else if (event.message?.text) {
+                tasks.push(handleUserMessage(event).catch(err => console.error('💥 Error handling user message:', err)));
             }
         }
+    }
+
+    // Process all concurrent messages in parallel without blocking each other
+    if (tasks.length > 0) {
+        Promise.all(tasks).catch(err => console.error('💥 Error in batch dispatch:', err));
     }
 });
 
