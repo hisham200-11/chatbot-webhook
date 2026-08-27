@@ -147,8 +147,10 @@ const GEMINI_SCHEMA = {
 // ============================================================
 app.get('/webhook', (req, res) => {
     if (req.query['hub.verify_token'] === process.env.VERIFY_TOKEN) {
+        console.log('🤝 [HANDSHAKE] Facebook webhook verified successfully!');
         return res.send(req.query['hub.challenge']);
     }
+    console.warn('⚠️ [HANDSHAKE REJECTED] Verify token mismatch!');
     res.sendStatus(403);
 });
 
@@ -168,7 +170,7 @@ app.post('/webhook', async (req, res) => {
                     await handleUserMessage(event);
                 }
             } catch (err) {
-                console.error('Error handling event:', err);
+                console.error('💥 Error handling event:', err);
             }
         }
     }
@@ -182,12 +184,15 @@ async function handleUserMessage(event) {
     const rawText  = event.message.text;
     const text     = rawText.toLowerCase().trim();
 
+    console.log(`\n📩 [INCOMING] From PSID: ${senderId} | Message: "${rawText}"`);
+
     // Get or create conversation, capturing ad referral if present
     const conversation = await getOrCreateConversation(senderId, event.referral);
     await logMessage(conversation.id, 'user', rawText);
 
     // A human is already handling this thread — bot stays silent.
     if (conversation.status === 'human' || conversation.status === 'pending_human') {
+        console.log(`⏸️ [BOT PAUSED] Thread status is '${conversation.status}'. Bot is staying silent. (Type "/bot resume" in chat to unpause).`);
         return;
     }
 
@@ -201,21 +206,25 @@ async function handleUserMessage(event) {
         await logMessage(conversation.id, 'bot', reply);
         await sendReply(senderId, reply);
         await notifyAdmin(senderId, conversation, 'Patient requested to speak with a human/dentist.');
+        console.log(`👤 [HANDOFF REQUESTED] Sent transfer notice to PSID: ${senderId}`);
         return;
     }
 
     // ── AI-powered conversation ──
+    console.log(`🤖 Generating AI reply using ${AI_PROVIDER.toUpperCase()}...`);
     const chatHistory = await getRecentChatHistory(conversation.id, 6);
     const aiResponse  = await getAIResponse(chatHistory, rawText);
 
     // Send the reply to the patient
     await logMessage(conversation.id, 'bot', aiResponse.reply_text);
     await sendReply(senderId, aiResponse.reply_text);
+    console.log(`💬 [REPLY SENT] "${aiResponse.reply_text}"`);
 
     // If AI detected handoff intent
     if (aiResponse.is_handoff) {
         await db.query('UPDATE conversations SET status = ? WHERE id = ?', ['pending_human', conversation.id]);
         await notifyAdmin(senderId, conversation, 'Patient requested to speak with a human/dentist.');
+        console.log(`👤 [AI HANDOFF] AI triggered human transfer.`);
         return;
     }
 
