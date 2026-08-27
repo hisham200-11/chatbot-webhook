@@ -68,7 +68,6 @@ Doctor & Clinic Details:
 - Parking: Free basement parking available for patients.
 
 Your Personality & Tone:
-- Sound like a real, cheerful, helpful human receptionist on Facebook Messenger. Use warm Filipino phrasing (po/opo), emojis, and natural conversational Taglish.
 - NEVER sound like a stiff robot. Be empathetic, approachable, and encouraging.
 
 Your goals (in priority order):
@@ -76,13 +75,15 @@ Your goals (in priority order):
 2. Provide pricing RANGES (never exact quotes — explain that final price depends on assessment).
 3. Offer our promo: a FREE consultation & 3D digital smile scan.
 4. Naturally ask for their NAME, PHONE NUMBER, and PREFERRED DAY to reserve their consultation.
-5. If they want to talk to the dentist or a human directly, set is_handoff to true.
+5. STRICT HANDOFF CRITERIA: ONLY set is_handoff to true if the patient EXPLICITLY and UNAMBIGUOUSLY demands a human staff member (e.g., "transfer me to a live agent", "ayoko makipag-usap sa bot", "human staff please"), has an urgent medical emergency, or a serious formal complaint. If they ask casual questions like "are you an AI?", "tao ka ba?", "sino si doc?", or general clinic questions, do NOT hand off — answer them yourself cheerfully as Mae!
 
 Conversation Examples (speak naturally like this):
 - User: "Hm po braces?"
   Reply: "Hello po! 😊 Ang metal braces po natin starts at ₱35,000 po, with downpayment na ₱5,000 and ₱1,500/month installment. May promo po kami this week na FREE consultation & 3D smile scan! What's your name po, and available po ba kayo this week para ma-check ni Doc?"
 - User: "Masakit po ba magpa-implant?"
   Reply: "Wag po kayong mag-alala! 😊 May local anesthesia po tayo kaya painless po ang procedure. Para po mas maipaliwanag ni Doc, let's book you for a free assessment po. May I have your name and best phone number po?"
+- User: "Tao ka ba or AI?"
+  Reply: "Hello po! 😊 Ako po si Mae, ang AI clinic coordinator ng BrightSmile Dental Clinic! Nandito po ako para tulungan kayo sa inquiries, pricing, at free appointment booking. Paano po kita matutulungan today?"
 
 Strict Guardrails:
 - NEVER diagnose or prescribe medication over chat.
@@ -107,20 +108,22 @@ Always respond with a valid JSON object matching this EXACT structure:
   "procedure_interested": "Dental procedure mentioned (e.g. 'Braces', 'Cleaning', 'Veneers'), or null",
   "preferred_schedule": "Preferred appointment day/time if mentioned (e.g. 'Saturday morning'), or null",
   "is_ready_for_booking": true if patient provided both name and contact number, otherwise false,
-  "is_handoff": true if patient explicitly wants to speak with a human/dentist/agent, otherwise false
+  "is_handoff": true ONLY if patient explicitly demands a live human agent/complaint/emergency, otherwise false
 }`;
 
 
-// Phrases that mean "I want to talk to a real person"
-const HANDOFF_KEYWORDS = [
-    'agent', 'human', 'representative', 'real person',
-    'talk to someone', 'speak to someone', 'customer service',
-    'talk to a person', 'live agent', 'talk to the dentist',
-    'makausap', 'tao', 'real na tao',
+// Strict phrases that mean the patient explicitly demands a live human staff member
+const STRICT_HANDOFF_PHRASES = [
+    'talk to a live agent', 'speak to a live agent', 'transfer to live agent',
+    'talk to a human agent', 'speak to a human agent', 'transfer to human',
+    'gusto ko makausap ang live agent', 'ayoko sa bot', 'makausap ang live staff',
+    'live agent please', 'human agent please', 'kausap na totoong tao',
+    'reklamo sa clinic', 'emergency dental'
 ];
 
-// Command an admin types manually in Messenger to give control back to the bot
+// Commands / natural words that reset / re-engage the bot automatically
 const RESUME_COMMAND = '/bot resume';
+const NATURAL_RESUME_WORDS = ['hi', 'hello', 'start', 'restart', 'reset', 'start over', 'menu', 'balik bot', 'inquire', 'magkano', '/bot resume', 'resume'];
 
 // ── JSON response schemas for structured output ──
 const OPENAI_SCHEMA = {
@@ -285,23 +288,47 @@ async function handleUserMessage(event) {
     const conversation = await getOrCreateConversation(senderId, event.referral);
     await logMessage(conversation.id, 'user', rawText);
 
-    // A human is already handling this thread — bot stays silent.
+    // ── Smart Auto-Resume Triggers & Inactivity Timeout ──
+    const isNaturalResume = NATURAL_RESUME_WORDS.some(w => text === w || text.startsWith(w + ' '));
+    const lastActivity = new Date(conversation.updated_at).getTime();
+    const minutesInactive = (Date.now() - lastActivity) / (1000 * 60);
+    const isInactiveTimeout = minutesInactive >= 15; // 15 mins of staff silence = auto-resume
+
     if (conversation.status === 'human' || conversation.status === 'pending_human') {
-        console.log(`⏸️ [BOT PAUSED] Thread status is '${conversation.status}'. Bot is staying silent. (Type "/bot resume" in chat to unpause).`);
-        return;
+        if (isNaturalResume || isInactiveTimeout) {
+            await db.query('UPDATE conversations SET status = ? WHERE id = ?', ['bot', conversation.id]);
+            conversation.status = 'bot';
+            console.log(`🔄 [AUTO-RESUME] Bot reactivated for PSID: ${senderId} (Reason: ${isNaturalResume ? `keyword '${text}'` : `${Math.round(minutesInactive)}m inactivity`}).`);
+        } else {
+            // Check if user is asking a dental question while waiting for human
+            const hasDentalInquiry = text.includes('?') || text.includes('magkano') || text.includes('hm') || 
+                                     text.includes('how much') || text.includes('saan') || text.includes('location') ||
+                                     text.includes('bukas') || text.includes('schedule') || text.includes('cleaning') ||
+                                     text.includes('braces') || text.includes('pasta') || text.includes('bunot') ||
+                                     text.includes('promo') || text.includes('dentist');
+
+            // If staff just replied 2 mins ago and it's not a question, stay quiet
+            if (conversation.status === 'human' && !hasDentalInquiry) {
+                console.log(`⏸️ [STAFF ACTIVE] Human staff chatting recently (${Math.round(minutesInactive)}m ago). Bot staying quiet.`);
+                return;
+            }
+
+            // Otherwise, continue answering so the patient is never ignored!
+            console.log(`💬 [AUTO-ASSIST] Generating AI assistance for PSID: ${senderId} while staff is away.`);
+        }
     }
 
-    // Check if the user is explicitly asking for a human (before AI).
+    // Check if the user is strictly demanding a live human agent (explicit phrases only)
     if (detectHandoffIntent(text)) {
         await db.query(
             'UPDATE conversations SET status = ? WHERE id = ?',
             ['pending_human', conversation.id]
         );
-        const reply = "Sure po — I'll connect you with our clinic team right away. Someone will message you shortly! 😊";
+        const reply = "Naiintindihan po namin! 😊 I-notify ko po agad ang aming human clinic staff para ma-review ang inyong inquiry. In the meantime, kung may general questions po kayo sa aming services at rates, pwede ko pa rin po kayong tulungan dito anytime!";
         await logMessage(conversation.id, 'bot', reply);
         await sendReply(senderId, reply);
-        await notifyAdmin(senderId, conversation, 'Patient requested to speak with a human/dentist.');
-        console.log(`👤 [HANDOFF REQUESTED] Sent transfer notice to PSID: ${senderId}`);
+        await notifyAdmin(senderId, conversation, 'Patient explicitly requested a live human staff member.');
+        console.log(`👤 [STRICT HANDOFF] Sent transfer notice to PSID: ${senderId}`);
         return;
     }
 
@@ -315,12 +342,11 @@ async function handleUserMessage(event) {
     await sendReply(senderId, aiResponse.reply_text);
     console.log(`💬 [REPLY SENT] "${aiResponse.reply_text}"`);
 
-    // If AI detected handoff intent
+    // If AI strictly detected explicit handoff intent
     if (aiResponse.is_handoff) {
         await db.query('UPDATE conversations SET status = ? WHERE id = ?', ['pending_human', conversation.id]);
-        await notifyAdmin(senderId, conversation, 'Patient requested to speak with a human/dentist.');
+        await notifyAdmin(senderId, conversation, 'Patient requested live human support.');
         console.log(`👤 [AI HANDOFF] AI triggered human transfer.`);
-        return;
     }
 
     // Update lead info if AI extracted any new data (with regex fallback)
@@ -611,7 +637,7 @@ async function logMessage(conversationId, sender, text) {
 }
 
 function detectHandoffIntent(text) {
-    return HANDOFF_KEYWORDS.some(k => text.includes(k));
+    return STRICT_HANDOFF_PHRASES.some(phrase => text.includes(phrase));
 }
 
 // ============================================================
