@@ -1,7 +1,7 @@
 // ============================================================
 // Facebook Messenger — AI Dental Lead Qualification Engine
-// Supports: Gemini Flash (free) or OpenAI GPT-4o-mini
-// Set AI_PROVIDER=gemini (default) or AI_PROVIDER=openai in .env
+// Supports: Groq Llama 3.3 70B (free), Gemini Flash, OpenAI
+// Set AI_PROVIDER=groq (default), gemini, or openai in .env
 // ============================================================
 require('dotenv').config();
 const express    = require('express');
@@ -13,15 +13,20 @@ const app = express();
 app.use(express.json());
 
 // ── AI Provider selection ──
-const AI_PROVIDER = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'groq').toLowerCase();
 
 let openai = null;
 let gemini = null;
+let groq   = null;
 
 if (AI_PROVIDER === 'openai') {
     const OpenAI = require('openai');
     openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     console.log('AI Provider: OpenAI GPT-4o-mini');
+} else if (AI_PROVIDER === 'groq') {
+    const Groq = require('groq-sdk');
+    groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    console.log('AI Provider: Groq Llama 3.3 70B (free & high-limit)');
 }
 // Gemini is initialized asynchronously below (ESM import)
 
@@ -34,7 +39,6 @@ const db = mysql.createPool({
     database: process.env.DB_NAME,
 });
 
-
 // ── Email transport (for lead notifications) ──
 const mailer = nodemailer.createTransport({
     host:   process.env.SMTP_HOST,
@@ -46,41 +50,44 @@ const mailer = nodemailer.createTransport({
     },
 });
 
-// Phrases that mean "I want to talk to a real person"
-const HANDOFF_KEYWORDS = [
-    'agent', 'human', 'representative', 'real person',
-    'talk to someone', 'speak to someone', 'customer service',
-    'talk to a person', 'live agent', 'talk to the dentist',
-    'makausap', 'tao', 'real na tao',
-];
-
-// Command an admin types manually in Messenger to give control back to the bot
-const RESUME_COMMAND = '/bot resume';
-
 // ── Clinic configuration (from .env) ──
-const CLINIC_NAME     = process.env.CLINIC_NAME     || 'Our Dental Clinic';
-const CLINIC_LOCATION = process.env.CLINIC_LOCATION || '';
+const CLINIC_NAME     = process.env.CLINIC_NAME     || 'BrightSmile Dental Clinic';
+const CLINIC_LOCATION = process.env.CLINIC_LOCATION || 'BGC, Taguig City';
 const CLINIC_HOURS    = process.env.CLINIC_HOURS    || 'Mon-Sat 9AM-6PM';
 const CLINIC_SERVICES = process.env.CLINIC_SERVICES || 'Veneers, Dental Implants, Braces, Teeth Whitening, General Dentistry';
 
 // ── Dental concierge system prompt ──
-const SYSTEM_PROMPT = `You are the friendly, professional AI concierge for ${CLINIC_NAME}${CLINIC_LOCATION ? ` located in ${CLINIC_LOCATION}` : ''}.
+const SYSTEM_PROMPT = `You are "Mae", the super friendly, caring, and professional clinic coordinator for ${CLINIC_NAME}${CLINIC_LOCATION ? ` located in ${CLINIC_LOCATION}` : ''}.
 Clinic hours: ${CLINIC_HOURS}.
 Services offered: ${CLINIC_SERVICES}.
 
-Your goals (in priority order):
-1. Warmly greet the patient and answer their dental questions naturally.
-2. Provide transparent pricing RANGES (never exact quotes — always say "starts from ₱X depending on clinical assessment").
-3. Gently guide the conversation toward booking a FREE consultation / 3D smile assessment.
-4. Collect the patient's NAME and PHONE NUMBER so the clinic can confirm the appointment.
-5. If they ask to speak with a human or the dentist directly, set is_handoff to true.
+Doctor & Clinic Details:
+- Head Dentist: Dr. Juan Santos, DMD (Orthodontics & Aesthetic Dentistry)
+- Payment Terms: Braces downpayment starts at ₱5,000; monthly installment ₱1,500/month.
+- Accepted Payment: Cash, GCash, Maya, Major Credit Cards, HMO (Maxicare, Medicard).
+- Parking: Free basement parking available for patients.
 
-Conversation rules:
-- Be warm, empathetic, and conversational. Use polite Filipino particles (po, opo) when the patient writes in Tagalog/Taglish.
-- NEVER diagnose or give medical advice. Always recommend an in-person assessment.
-- Keep replies concise (2-4 sentences max). Do not write essays.
-- If you already have their name and phone, do NOT ask again — just confirm the booking.
-- If the patient seems unsure, reassure them that the consultation is free and no-commitment.
+Your Personality & Tone:
+- Sound like a real, cheerful, helpful human receptionist on Facebook Messenger. Use warm Filipino phrasing (po/opo), emojis, and natural conversational Taglish.
+- NEVER sound like a stiff robot. Be empathetic, approachable, and encouraging.
+
+Your goals (in priority order):
+1. Warmly greet the patient and answer their questions conversationally.
+2. Provide pricing RANGES (never exact quotes — explain that final price depends on assessment).
+3. Offer our promo: a FREE consultation & 3D digital smile scan.
+4. Naturally ask for their NAME, PHONE NUMBER, and PREFERRED DAY to reserve their consultation.
+5. If they want to talk to the dentist or a human directly, set is_handoff to true.
+
+Conversation Examples (speak naturally like this):
+- User: "Hm po braces?"
+  Reply: "Hello po! 😊 Ang metal braces po natin starts at ₱35,000 po, with downpayment na ₱5,000 and ₱1,500/month installment. May promo po kami this week na FREE consultation & 3D smile scan! What's your name po, and available po ba kayo this week para ma-check ni Doc?"
+- User: "Masakit po ba magpa-implant?"
+  Reply: "Wag po kayong mag-alala! 😊 May local anesthesia po tayo kaya painless po ang procedure. Para po mas maipaliwanag ni Doc, let's book you for a free assessment po. May I have your name and best phone number po?"
+
+Strict Guardrails:
+- NEVER diagnose or prescribe medication over chat.
+- Keep responses concise (2 to 4 sentences max).
+- If you already have their name and phone, do NOT ask again — just warmly confirm the booking.
 
 Pricing guide (use as RANGES only):
 - Teeth Cleaning: ₱800 – ₱2,500
@@ -92,6 +99,18 @@ Pricing guide (use as RANGES only):
 - Wisdom Tooth Extraction: ₱5,000 – ₱15,000
 
 Always respond with valid JSON matching the required schema. The reply_text field is what will be sent to the patient.`;
+
+
+// Phrases that mean "I want to talk to a real person"
+const HANDOFF_KEYWORDS = [
+    'agent', 'human', 'representative', 'real person',
+    'talk to someone', 'speak to someone', 'customer service',
+    'talk to a person', 'live agent', 'talk to the dentist',
+    'makausap', 'tao', 'real na tao',
+];
+
+// Command an admin types manually in Messenger to give control back to the bot
+const RESUME_COMMAND = '/bot resume';
 
 // ── JSON response schemas for structured output ──
 const OPENAI_SCHEMA = {
@@ -231,20 +250,43 @@ async function handleEcho(event) {
 }
 
 // ============================================================
-// AI Response — Dual provider: Gemini Flash (free) or OpenAI
+// AI Response — Triple provider: Groq (free), Gemini (free), OpenAI
 // ============================================================
 async function getAIResponse(chatHistory, currentMessage) {
     try {
         if (AI_PROVIDER === 'openai') {
             return await getOpenAIResponse(chatHistory, currentMessage);
-        } else {
+        } else if (AI_PROVIDER === 'gemini') {
             return await getGeminiResponse(chatHistory, currentMessage);
+        } else {
+            return await getGroqResponse(chatHistory, currentMessage);
         }
     } catch (err) {
         console.error(`${AI_PROVIDER} API error:`, err.message);
         // Graceful fallback if AI is down
         return getFallbackResponse();
     }
+}
+
+// ── Groq Llama 3.3 70B (free, high limit, ultra fast) ──
+async function getGroqResponse(chatHistory, currentMessage) {
+    const messages = [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...chatHistory,
+        { role: 'user', content: currentMessage },
+    ];
+
+    const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+
+    const completion = await groq.chat.completions.create({
+        model,
+        messages,
+        response_format: { type: 'json_object' },
+        temperature: 0.7,
+        max_tokens: 1024,
+    });
+
+    return JSON.parse(completion.choices[0].message.content);
 }
 
 // ── OpenAI GPT-4o-mini ──
@@ -496,4 +538,4 @@ Type "${RESUME_COMMAND}" in that thread when you're done to hand control back to
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🦷 Dental AI Webhook running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🦷 Dental AI Webhook running on port ${PORT}`));
